@@ -1,23 +1,29 @@
 """
 Automatic LIBS raster: Standa XYZ stage (libximc) + SciAps Z903 handheld (HTTP Remote Service).
 
-For every grid point:  move stage -> wait until stopped -> settle -> fire LIBS -> wait -> log -> next.
+For every grid point:  move stage -> wait until stopped -> settle -> run one LIBS test -> save spectrum -> next.
+
+The LIBS test is SciAps' "POST /data/raster?mode=<mode>" (SA-NGL Remote Service API). The request
+returns only when the test has finished, with the averaged spectrum in the response, so the stage
+never moves during a shot. The test uses the acquisition settings of that app on the handheld
+(e.g. Geochem settings: locations, cleaning shots, data shots, argon).
 
 Before the first real run:
-  1. Put the Z903 in "Remote Service" (swipe left on home screen -> Remote Service) and note its IP.
-  2. Fill in the LIBS_* settings below from SciAps' "SA-NGL Remote Service" PDF / w_LIBS_example.py
-     (Yen-Wei Lin, Aug 21 2024). The script will not fire until LIBS_SHOOT_PATH is set.
-  3. Test pieces separately:
-       python raster_libs.py --libs-test             # fire one shot, no stage
+  1. Z903: connect the PC to the handheld's hotspot (or the same Wi-Fi) and turn on Remote Service.
+  2. Test pieces separately:
+       python raster_libs.py --libs-test             # one LIBS test, no stage; saves libs_test.json
        python raster_libs.py --no-libs  -nx 3 -ny 3  # move stage only, no laser
        python raster_libs.py --simulate -nx 3 -ny 3  # no hardware at all
 
 Example run (50 x 50 grid, 150 um spacing):
   python raster_libs.py -nx 50 -ny 50 --step-um 150
 
-If the handheld drops off Wi-Fi, the stage holds position and the shot is retried for up to
---max-wait-min minutes. Every shot is written to the CSV log immediately (grid settings go in
-<log>.csv.json). If the run stops for any reason, continue from the next spot with:
+Output: raster_<date>.csv (one row per spot), raster_<date>.csv.json (grid settings) and
+raster_<date>_spectra/shot_00001.json ... (the handheld's full response for each spot).
+
+If the handheld drops off Wi-Fi or the laser needs to cool/warm up, the stage holds position and the
+test is retried for up to --max-wait-min minutes. If the run stops for any reason, continue from the
+next spot with:
   python raster_libs.py --resume raster_YYYYMMDD_HHMMSS.csv
 """
 import argparse
@@ -41,69 +47,96 @@ Z_START_STEPS = -3000    # Z offset applied after homing, before zeroing (same a
 X_SIGN = -1              # original script moved X in the negative direction
 
 # ---------------------------------------------------------------------------
-# LIBS (SciAps Remote Service, HTTP) settings
-# TODO: fill these in from the SciAps API PDF / w_LIBS_example.py
+# LIBS (SciAps Remote Service, HTTP) settings -- from SA-NGL Remote Service PDF / w_LIBS_example.py
 # ---------------------------------------------------------------------------
-LIBS_IP = "192.168.0.207"      # IP shown on the Z903 Remote Service screen (USB tether is 192.168.42.129)
-LIBS_PORT = None               # e.g. 8080 -- check the API doc / example script
-LIBS_SHOOT_METHOD = "POST"     # GET, PUT or POST, per the API doc
-LIBS_SHOOT_PATH = None         # e.g. "/api/..." -- the endpoint that starts a test/shot
-LIBS_SHOOT_PAYLOAD = None      # dict sent as JSON body, if the endpoint needs one
-LIBS_TIMEOUT_S = 30            # HTTP timeout; the shot request may block until the test finishes
+LIBS_IP = "192.168.43.1"   # Z903 hotspot address (USB tether would be 192.168.42.129)
+LIBS_PORT = 8080
+LIBS_MODE = "Geochem"      # Alloy, AlloyPlus, Carbon, Geochem, Empirical, ... (app whose settings are used)
+LIBS_TIMEOUT_S = 180       # the raster request blocks until the whole test is done
+
+# Status codes from /data/raster, sorted by what the script should do about them
+STATUS_OK = "CODE_SUCCESS"
+STATUS_RETRY = {"CODE_LASER_NOT_READY", "CODE_LASER_OVERHEATING", "CODE_LASER_NEEDS_WARM_UP", "CODE_TIMEOUT"}
+STATUS_SKIP = {"CODE_NO_SAMPLE_DETECTED", "CODE_AIRSHOT_AUTO_ABORT"}   # log the spot and move on
+# anything else (CODE_LOW_ARGON, CODE_ABORT, CODE_INVALID_CONFIG, CODE_WRONG_STAGE, ...) stops the run
 
 
 def libs_base_url():
-    port = f":{LIBS_PORT}" if LIBS_PORT else ""
-    return f"http://{LIBS_IP}{port}"
+    return "http://{}:{}".format(LIBS_IP, LIBS_PORT)
+
+
+class LibsStop(Exception):
+    """The handheld reported something a person has to fix; stop and save progress."""
+
+
+class LibsRetry(Exception):
+    """Temporary condition (laser warming up / cooling down); retry the same spot."""
 
 
 class LibsClient:
-    def __init__(self, simulate=False):
+    def __init__(self, mode=LIBS_MODE, all_spectra=False, simulate=False):
+        self.mode = mode
+        self.all_spectra = all_spectra
         self.simulate = simulate
-        if simulate:
-            return
-        if not LIBS_SHOOT_PATH:
-            sys.exit("LIBS_SHOOT_PATH is not set. Fill in the LIBS_* settings at the top of "
-                     "raster_libs.py from the SciAps API doc, or run with --no-libs / --simulate.")
-        import requests
-        self.session = requests.Session()
+        if not simulate:
+            import requests
+            self.session = requests.Session()
 
     def reachable(self, timeout_s=3):
         """True if the analyzer's Remote Service port accepts a TCP connection."""
         if self.simulate:
             return True
         try:
-            socket.create_connection((LIBS_IP, LIBS_PORT or 80), timeout=timeout_s).close()
+            socket.create_connection((LIBS_IP, LIBS_PORT), timeout=timeout_s).close()
             return True
         except OSError:
             return False
 
+    def settings(self):
+        """Acquisition settings the handheld will use for this mode."""
+        if self.simulate:
+            return {"mNumLocations": 1, "mNumCleaningPerLocation": 12, "mNumDataPerLocation": 16, "mUseArgon": False}
+        r = self.session.get(libs_base_url() + "/instrument/acquisitionParams",
+                             params={"mode": self.mode}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
     def shoot(self):
-        """Fire one LIBS test. Returns a short string for the log."""
+        """Run one LIBS test. Returns the handheld's JSON response (status, metadata, spectra)."""
         if self.simulate:
             time.sleep(0.2)
-            return "simulated"
-        url = libs_base_url() + LIBS_SHOOT_PATH
-        r = self.session.request(LIBS_SHOOT_METHOD, url, json=LIBS_SHOOT_PAYLOAD, timeout=LIBS_TIMEOUT_S)
+            return {"status": STATUS_OK, "abortedByUser": "false", "results": []}
+        path = "/data/raster/all" if self.all_spectra else "/data/raster"
+        r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, timeout=LIBS_TIMEOUT_S)
         r.raise_for_status()
-        return r.text[:200].replace("\n", " ")
+        return r.json()
 
     def shoot_until_ok(self, max_wait_min):
         """
-        Fire one shot. If the analyzer is unreachable or the request fails, keep the stage where it is
-        and retry with increasing pauses for up to max_wait_min minutes.
-        Returns (response, attempts) or raises ConnectionError if the handheld never comes back.
+        Run one test at the current spot. Network failures and temporary laser states are retried with
+        increasing pauses (stage holding position) for up to max_wait_min minutes.
+        Returns (response, attempts). Raises LibsStop for conditions a person has to fix.
         """
         deadline = time.time() + max_wait_min * 60
         attempt, pause = 0, 2
         while True:
             attempt += 1
             try:
-                return self.shoot(), attempt
+                resp = self.shoot()
+                status = resp.get("status")
+                if str(resp.get("abortedByUser")).lower() == "true":
+                    raise LibsStop("test aborted on the handheld screen")
+                if status in STATUS_RETRY:
+                    raise LibsRetry(status)
+                if status != STATUS_OK and status not in STATUS_SKIP:
+                    raise LibsStop("handheld reported {}".format(status))
+                return resp, attempt
+            except LibsStop:
+                raise
             except Exception as e:
                 if time.time() > deadline:
-                    raise ConnectionError("LIBS unreachable for {} min: {}".format(max_wait_min, e))
-                print("\n[{}] LIBS shot failed (attempt {}): {}. Waiting {} s, stage holding position...".format(
+                    raise LibsStop("LIBS not working for {} min: {}".format(max_wait_min, e))
+                print("\n[{}] LIBS test failed (attempt {}): {}. Waiting {} s, stage holding position...".format(
                     datetime.datetime.now().strftime("%H:%M:%S"), attempt, e, pause))
                 time.sleep(pause)
                 while not self.reachable() and time.time() < deadline:
@@ -211,8 +244,8 @@ def raster_points(nx, ny, step_steps, serpentine=True):
             yield i, j, X_SIGN * i * step_steps, j * step_steps
 
 
-LOG_HEADER = ["shot", "i", "j", "x_um", "y_um", "z_um", "time", "attempts", "libs_response"]
-GRID_KEYS = ("nx", "ny", "step_um", "z_um", "serpentine")
+LOG_HEADER = ["shot", "i", "j", "x_um", "y_um", "z_um", "time", "attempts", "status",
+              "laser_temp", "argon_psi", "spectrum_file"]
 
 
 def load_resume(log_path):
@@ -227,6 +260,24 @@ def load_resume(log_path):
     return grid, done
 
 
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def print_settings(libs):
+    s = libs.settings()
+    print("Handheld {} settings: {} location(s) per test, {} cleaning + {} data shots per location, argon {}".format(
+        libs.mode, s.get("mNumLocations"), s.get("mNumCleaningPerLocation"), s.get("mNumDataPerLocation"),
+        "on" if s.get("mUseArgon") else "off"))
+    if (s.get("mNumLocations") or 1) > 1:
+        print("  WARNING: the handheld moves its own internal stage to {} locations per test, so each grid point "
+              "gets {} spots, not 1. Set Locations to 1 in the {} settings on the handheld for one spot per point."
+              .format(s.get("mNumLocations"), s.get("mNumLocations"), libs.mode))
+
+
 def run(args):
     if args.resume:
         log_path = args.resume
@@ -235,7 +286,7 @@ def run(args):
     else:
         log_path = args.log or "raster_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
-                "serpentine": not args.no_serpentine}
+                "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -247,15 +298,20 @@ def run(args):
         print("All {} shots already done.".format(total))
         return
 
-    libs = LibsClient(simulate=args.simulate or args.no_libs)
+    libs = LibsClient(mode=grid.get("mode", LIBS_MODE), all_spectra=grid.get("all_spectra", False),
+                      simulate=args.simulate or args.no_libs)
     if not libs.reachable():
-        sys.exit("Cannot reach the handheld at {}. Check Wi-Fi and that Remote Service is on.".format(libs_base_url()))
+        sys.exit("Cannot reach the handheld at {}. Check Wi-Fi/hotspot and that Remote Service is on.".format(
+            libs_base_url()))
+    print_settings(libs)
     stage = Stage(simulate=args.simulate)
 
+    spectra_dir = os.path.splitext(log_path)[0] + "_spectra"
+    os.makedirs(spectra_dir, exist_ok=True)
     print("Raster {} x {} = {} spots, {} um spacing. Log: {}".format(
         grid["nx"], grid["ny"], total, step_steps * UM_PER_STEP, log_path))
 
-    n = done
+    skipped_in_a_row = 0
     try:
         # Homing gives the same absolute zero every time, so a resumed run lands on the same grid.
         if not args.no_home:
@@ -280,16 +336,28 @@ def run(args):
                 resp, attempts = libs.shoot_until_ok(args.max_wait_min)
                 time.sleep(args.shot_wait_s)
 
+                status = resp.get("status")
+                skipped_in_a_row = skipped_in_a_row + 1 if status in STATUS_SKIP else 0
+                spectrum_file = "shot_{:05d}.json".format(n)
+                save_json(os.path.join(spectra_dir, spectrum_file), resp)
+                meta = resp.get("metadata", {})
                 log.writerow([n, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP, pz * UM_PER_STEP,
-                              datetime.datetime.now().isoformat(timespec="seconds"), attempts, resp])
+                              datetime.datetime.now().isoformat(timespec="seconds"), attempts, status,
+                              meta.get("mMaxLaserTemp", ""), meta.get("mArgonPSI", ""), spectrum_file])
                 f.flush()
                 os.fsync(f.fileno())
-                print("Shot {}/{}  i={} j={}  X={:.1f} um  Y={:.1f} um".format(
-                    n, total, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP), end="\r")
+                print("Shot {}/{}  i={} j={}  X={:.1f} um  Y={:.1f} um  {}".format(
+                    n, total, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP, status), end="\r")
+
+                if status in STATUS_SKIP:
+                    print("\nSpot {} ({}, {}): {} -- logged, moving on.".format(n, i, j, status))
+                    if skipped_in_a_row >= args.max_skips:
+                        raise LibsStop("{} spots in a row returned {}; check the sample / sample detection".format(
+                            skipped_in_a_row, status))
         print("\nRaster done.")
 
         stage.move(0, 0)
-    except (KeyboardInterrupt, ConnectionError, RuntimeError, TimeoutError) as e:
+    except (KeyboardInterrupt, LibsStop, RuntimeError, TimeoutError) as e:
         print("\nStopped: {}".format(e or "interrupted by user"))
         if os.path.exists(log_path + ".json"):
             print("Progress saved. To continue from the next spot run:\n  python raster_libs.py --resume {}".format(log_path))
@@ -305,21 +373,30 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--mode", default=LIBS_MODE, help="handheld app whose acquisition settings are used (default Geochem)")
+    p.add_argument("--all-spectra", action="store_true", help="save every shot's spectrum, not just the average")
     p.add_argument("--settle-s", type=float, default=0.5, help="pause after stage stops, before firing")
-    p.add_argument("--shot-wait-s", type=float, default=2.0, help="pause after the LIBS request returns")
+    p.add_argument("--shot-wait-s", type=float, default=0.5, help="pause after the LIBS test returns, before moving")
     p.add_argument("--max-wait-min", type=float, default=30,
-                   help="if the handheld drops off, keep retrying this long before stopping (progress is saved)")
+                   help="if the handheld drops off or the laser is not ready, keep retrying this long (progress is saved)")
+    p.add_argument("--max-skips", type=int, default=5,
+                   help="stop if this many spots in a row report no sample / air shot")
     p.add_argument("--resume", metavar="LOG_CSV", help="continue an interrupted run from its log file")
     p.add_argument("--no-serpentine", action="store_true", help="always scan rows left-to-right")
     p.add_argument("--no-home", action="store_true", help="skip homing (stage already zeroed)")
     p.add_argument("--no-libs", action="store_true", help="move the stage but do not fire")
     p.add_argument("--simulate", action="store_true", help="no hardware: fake stage and LIBS")
-    p.add_argument("--libs-test", action="store_true", help="fire a single LIBS shot and exit")
+    p.add_argument("--libs-test", action="store_true", help="run a single LIBS test, save libs_test.json and exit")
     p.add_argument("--log", help="CSV log path")
     args = p.parse_args()
 
     if args.libs_test:
-        print("LIBS response:", LibsClient(simulate=args.simulate).shoot())
+        libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, simulate=args.simulate)
+        print_settings(libs)
+        t0 = time.time()
+        resp = libs.shoot()
+        save_json("libs_test.json", resp)
+        print("Status: {}  ({:.1f} s). Full response saved to libs_test.json".format(resp.get("status"), time.time() - t0))
         return
     run(args)
 
