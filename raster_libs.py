@@ -74,8 +74,9 @@ class LibsRetry(Exception):
 
 
 class LibsClient:
-    def __init__(self, mode=LIBS_MODE, all_spectra=False, api="data", simulate=False):
+    def __init__(self, mode=LIBS_MODE, all_spectra=False, api="data", request=None, simulate=False):
         self.mode = mode
+        self.request = request      # dict sent as the JSON body of /data/raster (LIBZAcquireRequest)
         self.all_spectra = all_spectra
         self.api = api              # "data": /data/raster test,  "hardware": arm + /hardware/go
         self.armed = False
@@ -106,9 +107,11 @@ class LibsClient:
     def _check(self, r):
         """Raise LibsStop right away if the handheld does not support this request (no point retrying)."""
         if r.status_code in (400, 404, 405, 501):
-            hint = (" Try --api hardware (arm + /hardware/go) instead." if self.api == "data" else "")
-            raise LibsStop("handheld does not support {} {} (HTTP {} {}).{}".format(
-                r.request.method, r.url, r.status_code, r.reason, hint))
+            hint = (" Edit the request body file and pass it with --request (e.g. --request acquire_request.json)."
+                    if self.api == "data" and "/data/raster" in r.url else "")
+            detail = r.text.strip()[:300] or r.reason
+            raise LibsStop("handheld rejected {} {} (HTTP {}: {}).{}".format(
+                r.request.method, r.url, r.status_code, detail, hint))
         r.raise_for_status()
 
     def shoot(self):
@@ -119,7 +122,8 @@ class LibsClient:
         if self.api == "hardware":
             return self._shoot_hardware()
         path = "/data/raster/all" if self.all_spectra else "/data/raster"
-        r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, timeout=LIBS_TIMEOUT_S)
+        r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, json=self.request,
+                              timeout=LIBS_TIMEOUT_S)
         self._check(r)
         return r.json()
 
@@ -289,7 +293,7 @@ def raster_points(nx, ny, step_steps, serpentine=True):
 
 
 LOG_HEADER = ["shot", "i", "j", "x_um", "y_um", "z_um", "time", "attempts", "status",
-              "avgshots", "laser_temp", "argon_psi", "spectrum_file"]
+              "avgshots", "peak_ratio", "laser_temp", "argon_psi", "spectrum_file"]
 
 
 def load_resume(log_path):
@@ -304,6 +308,34 @@ def load_resume(log_path):
     return grid, done
 
 
+def spectrum_rows(resp):
+    data = resp.get("data")
+    if data is None and resp.get("results"):
+        data = resp["results"][-1].get("spectrum", {}).get("mPixels")
+    return [r for r in (data or []) if isinstance(r, list) and any(r)]
+
+
+def peak_ratio(resp):
+    """Highest pixel / median pixel over the spectrometer channels. Dark readings are ~1.0;
+    a spectrum with real emission lines is well above that."""
+    best = 0.0
+    for r in spectrum_rows(resp):
+        med = sorted(r)[len(r) // 2]
+        if med > 0:
+            best = max(best, max(r) / med)
+    return round(best, 2)
+
+
+DARK_RATIO = 1.5   # below this the spectrum looks like detector background only (laser did not fire)
+
+
+def load_request(path):
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def describe_data(resp):
     """Short summary of how much spectrum data a response holds."""
     data = resp.get("data")
@@ -315,7 +347,11 @@ def describe_data(resp):
     if not rows:
         return "{} values".format(len(data))
     nonzero = sum(1 for r in rows for v in r if v)
-    return "{} array(s) x {} values ({} non-zero)".format(len(rows), len(rows[0]), nonzero)
+    ratio = peak_ratio(resp)
+    verdict = ("looks like dark background only -- the laser probably did NOT fire" if ratio < DARK_RATIO
+               else "emission peaks present")
+    return "{} array(s) x {} values ({} non-zero); peak/background = {} -> {}".format(
+        len(rows), len(rows[0]), nonzero, ratio, verdict)
 
 
 def save_json(path, data):
@@ -392,7 +428,8 @@ def run(args):
         log_path = args.log or "raster_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
                 "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra,
-                "api": args.api, "pulses": args.pulses, "locations": args.locations}
+                "api": args.api, "pulses": args.pulses, "locations": args.locations,
+                "request": os.path.abspath(args.request) if args.request else None}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -405,7 +442,7 @@ def run(args):
         return
 
     libs = LibsClient(mode=grid.get("mode", LIBS_MODE), all_spectra=grid.get("all_spectra", False),
-                      api=grid.get("api", "data"),
+                      api=grid.get("api", "data"), request=load_request(grid.get("request")),
                       simulate=args.simulate or args.no_libs)
     require_reachable(libs)
     setup_libs(libs, grid.get("pulses"), grid.get("locations"))
@@ -445,23 +482,27 @@ def run(args):
                 time.sleep(args.shot_wait_s)
 
                 status = resp.get("status")
-                skipped_in_a_row = skipped_in_a_row + 1 if status in STATUS_SKIP else 0
+                dark = status == STATUS_OK and peak_ratio(resp) < DARK_RATIO
+                if dark:
+                    status = "DARK_NO_PEAKS"     # handheld said success but the spectrum has no emission lines
+                skipped_in_a_row = skipped_in_a_row + 1 if (status in STATUS_SKIP or dark) else 0
                 spectrum_file = "shot_{:05d}.json".format(n)
                 save_json(os.path.join(spectra_dir, spectrum_file), resp)
                 meta = resp.get("metadata", {})
                 log.writerow([n, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP, pz * UM_PER_STEP,
                               datetime.datetime.now().isoformat(timespec="seconds"), attempts, status,
-                              resp.get("avgshots", ""), meta.get("mMaxLaserTemp", ""), meta.get("mArgonPSI", ""), spectrum_file])
+                              resp.get("avgshots", ""), peak_ratio(resp), meta.get("mMaxLaserTemp", ""), meta.get("mArgonPSI", ""), spectrum_file])
                 f.flush()
                 os.fsync(f.fileno())
                 print("Shot {}/{}  i={} j={}  X={:.1f} um  Y={:.1f} um  {}".format(
                     n, total, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP, status), end="\r")
 
-                if status in STATUS_SKIP:
+                if status in STATUS_SKIP or dark:
                     print("\nSpot {} ({}, {}): {} -- logged, moving on.".format(n, i, j, status))
                     if skipped_in_a_row >= args.max_skips:
-                        raise LibsStop("{} spots in a row returned {}; check the sample / sample detection".format(
-                            skipped_in_a_row, status))
+                        raise LibsStop("{} spots in a row returned {}; {}".format(
+                            skipped_in_a_row, status,
+                            "the laser does not seem to be firing" if dark else "check the sample / sample detection"))
         print("\nRaster done. Data in {}".format(os.path.abspath(spectra_dir)))
 
         stage.move(0, 0)
@@ -482,6 +523,8 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--request", metavar="JSON_FILE",
+                   help="JSON body (LIBZAcquireRequest) sent with /data/raster, e.g. acquire_request.json")
     p.add_argument("--pulses", type=int, help="(--api hardware) micro register 142; had no effect on the lab Z903")
     p.add_argument("--locations", type=int,
                    help="(--api hardware) FPGA register 6; on the lab Z903 avgshots = locations / 4 (36 -> 9, 1 -> 0)")
@@ -510,7 +553,8 @@ def main():
     LIBS_PORT = args.port or LIBS_PORT
 
     if args.libs_test:
-        libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api, simulate=args.simulate)
+        libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api,
+                          request=load_request(args.request), simulate=args.simulate)
         require_reachable(libs)
         setup_libs(libs, args.pulses, args.locations)
         t0 = time.time()

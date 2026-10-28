@@ -1,0 +1,16 @@
+{
+  "mAnalysisMode": "Geochem",
+  "mNumLocations": 1,
+  "mNumCleaningPerLocation": 0,
+  "mNumDataPerLocation": 1,
+  "mNumShotAvgFPGA": 1,
+  "mLaserPulsePeriod": 20,
+  "mUseArgon": true,
+  "mArgonPreflush": 300,
+  "mUseGating": true,
+  "mIntegrationDelay": 19,
+  "mIntegrationPeriod": 0,
+  "mPreBurnType": "PRE_BURN_TYPE_SHORT",
+  "mAutoHomeStage": true,
+  "mSampleDetectionOnly": false
+}
