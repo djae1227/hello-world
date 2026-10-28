@@ -74,9 +74,11 @@ class LibsRetry(Exception):
 
 
 class LibsClient:
-    def __init__(self, mode=LIBS_MODE, all_spectra=False, simulate=False):
+    def __init__(self, mode=LIBS_MODE, all_spectra=False, api="data", simulate=False):
         self.mode = mode
         self.all_spectra = all_spectra
+        self.api = api              # "data": /data/raster test,  "hardware": arm + /hardware/go
+        self.armed = False
         self.simulate = simulate
         if not simulate:
             import requests
@@ -101,15 +103,39 @@ class LibsClient:
         r.raise_for_status()
         return r.json()
 
+    def _check(self, r):
+        """Raise LibsStop right away if the handheld does not support this request (no point retrying)."""
+        if r.status_code in (400, 404, 405, 501):
+            hint = (" Try --api hardware (arm + /hardware/go) instead." if self.api == "data" else "")
+            raise LibsStop("handheld does not support {} {} (HTTP {} {}).{}".format(
+                r.request.method, r.url, r.status_code, r.reason, hint))
+        r.raise_for_status()
+
     def shoot(self):
         """Run one LIBS test. Returns the handheld's JSON response (status, metadata, spectra)."""
         if self.simulate:
             time.sleep(0.2)
             return {"status": STATUS_OK, "abortedByUser": "false", "results": []}
+        if self.api == "hardware":
+            return self._shoot_hardware()
         path = "/data/raster/all" if self.all_spectra else "/data/raster"
         r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, timeout=LIBS_TIMEOUT_S)
-        r.raise_for_status()
+        self._check(r)
         return r.json()
+
+    def _shoot_hardware(self):
+        """Low-level API: arm the laser once, then POST /hardware/go (fires with the unit's current settings)."""
+        if not self.armed:
+            self._check(self.session.put(libs_base_url() + "/hardware/armlaser/1", timeout=10))
+            self.armed = True
+        r = self.session.post(libs_base_url() + "/hardware/go", timeout=LIBS_TIMEOUT_S)
+        self._check(r)
+        resp = r.json()
+        if resp.get("status") != "success":
+            self.armed = False      # re-arm before the retry
+            raise LibsRetry("hardware/go returned {}".format(resp.get("status")))
+        resp["status"] = STATUS_OK
+        return resp
 
     def shoot_until_ok(self, max_wait_min):
         """
@@ -268,7 +294,12 @@ def save_json(path, data):
 
 
 def print_settings(libs):
-    s = libs.settings()
+    try:
+        s = libs.settings()
+    except Exception as e:
+        print("(Could not read the handheld's {} settings -- not supported by this firmware: {}. Continuing.)".format(
+            libs.mode, str(e).split(" for url")[0]))
+        return
     print("Handheld {} settings: {} location(s) per test, {} cleaning + {} data shots per location, argon {}".format(
         libs.mode, s.get("mNumLocations"), s.get("mNumCleaningPerLocation"), s.get("mNumDataPerLocation"),
         "on" if s.get("mUseArgon") else "off"))
@@ -294,7 +325,8 @@ def run(args):
     else:
         log_path = args.log or "raster_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
-                "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra}
+                "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra,
+                "api": args.api}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -307,6 +339,7 @@ def run(args):
         return
 
     libs = LibsClient(mode=grid.get("mode", LIBS_MODE), all_spectra=grid.get("all_spectra", False),
+                      api=grid.get("api", "data"),
                       simulate=args.simulate or args.no_libs)
     require_reachable(libs)
     print_settings(libs)
@@ -380,6 +413,8 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--api", choices=["data", "hardware"], default="data",
+                   help="data: full test via /data/raster (default); hardware: arm laser + /hardware/go")
     p.add_argument("--mode", default=LIBS_MODE, help="handheld app whose acquisition settings are used (default Geochem)")
     p.add_argument("--all-spectra", action="store_true", help="save every shot's spectrum, not just the average")
     p.add_argument("--settle-s", type=float, default=0.5, help="pause after stage stops, before firing")
@@ -403,11 +438,14 @@ def main():
     LIBS_PORT = args.port or LIBS_PORT
 
     if args.libs_test:
-        libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, simulate=args.simulate)
+        libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api, simulate=args.simulate)
         require_reachable(libs)
         print_settings(libs)
         t0 = time.time()
-        resp = libs.shoot()
+        try:
+            resp = libs.shoot()
+        except LibsStop as e:
+            sys.exit("LIBS test failed: {}".format(e))
         save_json("libs_test.json", resp)
         print("Status: {}  ({:.1f} s). Full response saved to libs_test.json".format(resp.get("status"), time.time() - t0))
         return
