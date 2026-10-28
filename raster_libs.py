@@ -278,6 +278,14 @@ def print_settings(libs):
               .format(s.get("mNumLocations"), s.get("mNumLocations"), libs.mode))
 
 
+def require_reachable(libs):
+    if not libs.reachable():
+        sys.exit("Cannot reach the handheld at {}.\n"
+                 "  - On the handheld, open Remote Service and check it shows this IP (tap the gear icon to start it).\n"
+                 "  - Check the PC is on the handheld's Wi-Fi/hotspot.\n"
+                 "  - If Remote Service shows a different IP, add --ip <that IP> to the command.".format(libs_base_url()))
+
+
 def run(args):
     if args.resume:
         log_path = args.resume
@@ -300,9 +308,7 @@ def run(args):
 
     libs = LibsClient(mode=grid.get("mode", LIBS_MODE), all_spectra=grid.get("all_spectra", False),
                       simulate=args.simulate or args.no_libs)
-    if not libs.reachable():
-        sys.exit("Cannot reach the handheld at {}. Check Wi-Fi/hotspot and that Remote Service is on.".format(
-            libs_base_url()))
+    require_reachable(libs)
     print_settings(libs)
     stage = Stage(simulate=args.simulate)
 
@@ -368,6 +374,7 @@ def run(args):
 
 
 def main():
+    global LIBS_IP, LIBS_PORT
     p = argparse.ArgumentParser(description="Automatic LIBS raster with Standa stage + SciAps Z903")
     p.add_argument("-nx", type=int, default=5, help="number of points in X")
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
@@ -388,10 +395,16 @@ def main():
     p.add_argument("--simulate", action="store_true", help="no hardware: fake stage and LIBS")
     p.add_argument("--libs-test", action="store_true", help="run a single LIBS test, save libs_test.json and exit")
     p.add_argument("--log", help="CSV log path")
+    p.add_argument("--ip", help="handheld IP shown on its Remote Service screen (default {})".format(LIBS_IP))
+    p.add_argument("--port", type=int, help="Remote Service port (default {})".format(LIBS_PORT))
     args = p.parse_args()
+
+    LIBS_IP = args.ip or LIBS_IP
+    LIBS_PORT = args.port or LIBS_PORT
 
     if args.libs_test:
         libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, simulate=args.simulate)
+        require_reachable(libs)
         print_settings(libs)
         t0 = time.time()
         resp = libs.shoot()
