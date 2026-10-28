@@ -11,7 +11,7 @@ never moves during a shot. The test uses the acquisition settings of that app on
 Before the first real run:
   1. Z903: connect the PC to the handheld's hotspot (or the same Wi-Fi) and turn on Remote Service.
   2. Test pieces separately:
-       python raster_libs.py --libs-test             # one LIBS test, no stage; saves libs_test.json
+       python raster_libs.py --libs-test             # one LIBS test, no stage; saves libs_test_<time>.json
        python raster_libs.py --no-libs  -nx 3 -ny 3  # move stage only, no laser
        python raster_libs.py --simulate -nx 3 -ny 3  # no hardware at all
 
@@ -152,9 +152,6 @@ class LibsClient:
         if resp.get("status") != "success":
             self.armed = False      # re-arm before the retry
             raise LibsRetry("hardware/go returned {}".format(resp.get("status")))
-        if resp.get("avgshots") == 0:
-            raise LibsStop("the handheld fired but averaged 0 shots, so there is no spectrum. "
-                           "Increase --pulses / --locations.")
         resp["status"] = STATUS_OK
         return resp
 
@@ -292,7 +289,7 @@ def raster_points(nx, ny, step_steps, serpentine=True):
 
 
 LOG_HEADER = ["shot", "i", "j", "x_um", "y_um", "z_um", "time", "attempts", "status",
-              "pulses_fired", "laser_temp", "argon_psi", "spectrum_file"]
+              "avgshots", "laser_temp", "argon_psi", "spectrum_file"]
 
 
 def load_resume(log_path):
@@ -305,6 +302,20 @@ def load_resume(log_path):
             if row.get("shot", "").isdigit():
                 done = int(row["shot"])
     return grid, done
+
+
+def describe_data(resp):
+    """Short summary of how much spectrum data a response holds."""
+    data = resp.get("data")
+    if data is None and resp.get("results"):
+        data = resp["results"][0].get("spectrum", {}).get("mPixels")
+    if not data:
+        return "NONE (empty)"
+    rows = [r for r in data if isinstance(r, list)]
+    if not rows:
+        return "{} values".format(len(data))
+    nonzero = sum(1 for r in rows for v in r if v)
+    return "{} array(s) x {} values ({} non-zero)".format(len(rows), len(rows[0]), nonzero)
 
 
 def save_json(path, data):
@@ -402,8 +413,8 @@ def run(args):
 
     spectra_dir = os.path.splitext(log_path)[0] + "_spectra"
     os.makedirs(spectra_dir, exist_ok=True)
-    print("Raster {} x {} = {} spots, {} um spacing. Log: {}".format(
-        grid["nx"], grid["ny"], total, step_steps * UM_PER_STEP, log_path))
+    print("Raster {} x {} = {} spots, {} um spacing.".format(grid["nx"], grid["ny"], total, step_steps * UM_PER_STEP))
+    print("Log:     {}\nSpectra: {}".format(os.path.abspath(log_path), os.path.abspath(spectra_dir)))
 
     skipped_in_a_row = 0
     try:
@@ -428,6 +439,9 @@ def run(args):
                 px, py, pz = stage.position()
 
                 resp, attempts = libs.shoot_until_ok(args.max_wait_min)
+                if resp.get("avgshots") == 0:
+                    raise LibsStop("the handheld returned 0 averaged spectra (avgshots = 0), so there is no data. "
+                                   "Increase --locations.")
                 time.sleep(args.shot_wait_s)
 
                 status = resp.get("status")
@@ -448,7 +462,7 @@ def run(args):
                     if skipped_in_a_row >= args.max_skips:
                         raise LibsStop("{} spots in a row returned {}; check the sample / sample detection".format(
                             skipped_in_a_row, status))
-        print("\nRaster done.")
+        print("\nRaster done. Data in {}".format(os.path.abspath(spectra_dir)))
 
         stage.move(0, 0)
     except (KeyboardInterrupt, LibsStop, RuntimeError, TimeoutError) as e:
@@ -468,8 +482,9 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
-    p.add_argument("--pulses", type=int, help="(--api hardware) set laser pulses per location, e.g. 1")
-    p.add_argument("--locations", type=int, help="(--api hardware) set locations per fire, e.g. 1")
+    p.add_argument("--pulses", type=int, help="(--api hardware) micro register 142; had no effect on the lab Z903")
+    p.add_argument("--locations", type=int,
+                   help="(--api hardware) FPGA register 6; on the lab Z903 avgshots = locations / 4 (36 -> 9, 1 -> 0)")
     p.add_argument("--api", choices=["data", "hardware"], default="data",
                    help="data: full test via /data/raster (default); hardware: arm laser + /hardware/go")
     p.add_argument("--mode", default=LIBS_MODE, help="handheld app whose acquisition settings are used (default Geochem)")
@@ -485,7 +500,7 @@ def main():
     p.add_argument("--no-home", action="store_true", help="skip homing (stage already zeroed)")
     p.add_argument("--no-libs", action="store_true", help="move the stage but do not fire")
     p.add_argument("--simulate", action="store_true", help="no hardware: fake stage and LIBS")
-    p.add_argument("--libs-test", action="store_true", help="run a single LIBS test, save libs_test.json and exit")
+    p.add_argument("--libs-test", action="store_true", help="run a single LIBS test, save libs_test_<time>.json and exit")
     p.add_argument("--log", help="CSV log path")
     p.add_argument("--ip", help="handheld IP shown on its Remote Service screen (default {})".format(LIBS_IP))
     p.add_argument("--port", type=int, help="Remote Service port (default {})".format(LIBS_PORT))
@@ -503,10 +518,15 @@ def main():
             resp = libs.shoot()
         except LibsStop as e:
             sys.exit("LIBS test failed: {}".format(e))
-        save_json("libs_test.json", resp)
-        print("Status: {}  ({:.1f} s){}. Full response saved to libs_test.json".format(
-            resp.get("status"), time.time() - t0,
-            ", pulses fired: {}".format(resp["avgshots"]) if "avgshots" in resp else ""))
+        name = "libs_test_{}{}.json".format(
+            datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "_loc{}".format(args.locations) if args.locations is not None else "")
+        save_json(name, resp)
+        print("Status: {}  ({:.1f} s)".format(resp.get("status"), time.time() - t0))
+        if "avgshots" in resp:
+            print("avgshots (averaged spectra reported by the handheld): {}".format(resp["avgshots"]))
+        print("Spectrum data: {}".format(describe_data(resp)))
+        print("Saved to: {}".format(os.path.abspath(name)))
         return
     run(args)
 
