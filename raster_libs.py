@@ -123,6 +123,24 @@ class LibsClient:
         self._check(r)
         return r.json()
 
+    def hw_get(self, path):
+        """GET a hardware register (e.g. /hardware/micro/142) and return its integer value."""
+        if self.simulate:
+            return self._sim_regs.get(path, 20) if hasattr(self, "_sim_regs") else 20
+        r = self.session.get(libs_base_url() + path, timeout=10)
+        self._check(r)
+        return r.json()["value"]
+
+    def hw_put(self, path, value):
+        if self.simulate:
+            self._sim_regs = getattr(self, "_sim_regs", {})
+            self._sim_regs[path] = value
+            return
+        r = self.session.put(libs_base_url() + "{}/{}".format(path, int(value)), timeout=10)
+        self._check(r)
+        if r.json().get("status") != "success":
+            raise LibsStop("handheld did not accept {} = {}".format(path, value))
+
     def _shoot_hardware(self):
         """Low-level API: arm the laser once, then POST /hardware/go (fires with the unit's current settings)."""
         if not self.armed:
@@ -271,7 +289,7 @@ def raster_points(nx, ny, step_steps, serpentine=True):
 
 
 LOG_HEADER = ["shot", "i", "j", "x_um", "y_um", "z_um", "time", "attempts", "status",
-              "laser_temp", "argon_psi", "spectrum_file"]
+              "pulses_fired", "laser_temp", "argon_psi", "spectrum_file"]
 
 
 def load_resume(log_path):
@@ -291,6 +309,40 @@ def save_json(path, data):
         json.dump(data, f)
         f.flush()
         os.fsync(f.fileno())
+
+
+# Hardware registers from the SA-NGL Remote Service PDF (used with --api hardware)
+REG_PULSES = "/hardware/micro/142"     # pulses per location (micro register 0x8E)
+REG_LOCATIONS = "/hardware/fpga/6"     # test location count (FPGA register 6)
+
+
+def configure_hardware(libs, pulses=None, locations=None):
+    """Print the pulse/location registers, set them if asked, and read back to confirm."""
+    for name, reg, want in (("pulses per location", REG_PULSES, pulses),
+                            ("locations per fire", REG_LOCATIONS, locations)):
+        old = libs.hw_get(reg)
+        if want is None or want == old:
+            print("Handheld {}: {}".format(name, old))
+            continue
+        libs.hw_put(reg, want)
+        new = libs.hw_get(reg)
+        if new != want:
+            raise LibsStop("tried to set {} to {} but the handheld reports {}".format(name, want, new))
+        print("Handheld {}: {} -> {}  (to restore later: --{} {})".format(
+            name, old, new, "pulses" if reg == REG_PULSES else "locations", old))
+
+
+def setup_libs(libs, pulses=None, locations=None):
+    """Show (and for --api hardware, set) the handheld's shot settings before firing."""
+    try:
+        if libs.api == "hardware":
+            configure_hardware(libs, pulses, locations)
+        else:
+            if pulses is not None or locations is not None:
+                sys.exit("--pulses / --locations only work with --api hardware.")
+            print_settings(libs)
+    except LibsStop as e:
+        sys.exit("Could not set up the handheld: {}".format(e))
 
 
 def print_settings(libs):
@@ -326,7 +378,7 @@ def run(args):
         log_path = args.log or "raster_{}.csv".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
                 "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra,
-                "api": args.api}
+                "api": args.api, "pulses": args.pulses, "locations": args.locations}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -342,7 +394,7 @@ def run(args):
                       api=grid.get("api", "data"),
                       simulate=args.simulate or args.no_libs)
     require_reachable(libs)
-    print_settings(libs)
+    setup_libs(libs, grid.get("pulses"), grid.get("locations"))
     stage = Stage(simulate=args.simulate)
 
     spectra_dir = os.path.splitext(log_path)[0] + "_spectra"
@@ -382,7 +434,7 @@ def run(args):
                 meta = resp.get("metadata", {})
                 log.writerow([n, i, j, X_SIGN * px * UM_PER_STEP, py * UM_PER_STEP, pz * UM_PER_STEP,
                               datetime.datetime.now().isoformat(timespec="seconds"), attempts, status,
-                              meta.get("mMaxLaserTemp", ""), meta.get("mArgonPSI", ""), spectrum_file])
+                              resp.get("avgshots", ""), meta.get("mMaxLaserTemp", ""), meta.get("mArgonPSI", ""), spectrum_file])
                 f.flush()
                 os.fsync(f.fileno())
                 print("Shot {}/{}  i={} j={}  X={:.1f} um  Y={:.1f} um  {}".format(
@@ -413,6 +465,8 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--pulses", type=int, help="(--api hardware) set laser pulses per location, e.g. 1")
+    p.add_argument("--locations", type=int, help="(--api hardware) set locations per fire, e.g. 1")
     p.add_argument("--api", choices=["data", "hardware"], default="data",
                    help="data: full test via /data/raster (default); hardware: arm laser + /hardware/go")
     p.add_argument("--mode", default=LIBS_MODE, help="handheld app whose acquisition settings are used (default Geochem)")
@@ -440,14 +494,16 @@ def main():
     if args.libs_test:
         libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api, simulate=args.simulate)
         require_reachable(libs)
-        print_settings(libs)
+        setup_libs(libs, args.pulses, args.locations)
         t0 = time.time()
         try:
             resp = libs.shoot()
         except LibsStop as e:
             sys.exit("LIBS test failed: {}".format(e))
         save_json("libs_test.json", resp)
-        print("Status: {}  ({:.1f} s). Full response saved to libs_test.json".format(resp.get("status"), time.time() - t0))
+        print("Status: {}  ({:.1f} s){}. Full response saved to libs_test.json".format(
+            resp.get("status"), time.time() - t0,
+            ", pulses fired: {}".format(resp["avgshots"]) if "avgshots" in resp else ""))
         return
     run(args)
 
