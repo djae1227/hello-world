@@ -152,6 +152,9 @@ class LibsClient:
         if resp.get("status") != "success":
             self.armed = False      # re-arm before the retry
             raise LibsRetry("hardware/go returned {}".format(resp.get("status")))
+        if resp.get("avgshots") == 0:
+            raise LibsStop("the handheld fired but averaged 0 shots, so there is no spectrum. "
+                           "Increase --pulses / --locations.")
         resp["status"] = STATUS_OK
         return resp
 
