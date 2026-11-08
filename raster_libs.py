@@ -3,10 +3,12 @@ Automatic LIBS raster: Standa XYZ stage (libximc) + SciAps Z903 handheld (HTTP R
 
 For every grid point:  move stage -> wait until stopped -> settle -> run one LIBS test -> save spectrum -> next.
 
-The LIBS test is SciAps' "POST /data/raster?mode=<mode>" (SA-NGL Remote Service API). The request
-returns only when the test has finished, with the averaged spectrum in the response, so the stage
-never moves during a shot. The test uses the acquisition settings of that app on the handheld
-(e.g. Geochem settings: locations, cleaning shots, data shots, argon).
+The LIBS test is SciAps' "POST /api/v2/acquire?mode=<mode>" (per Yen-Wei Lin, SciAps, Nov 2026). The
+request returns only when the test has finished, with the spectrum in the response, so the stage never
+moves during a shot. The JSON body (acquire_request.json, or a single shot by default) overrides the
+handheld's saved settings; anything left out uses the saved value. The older /data/raster and
+/hardware/go calls are still available with --api data / --api hardware, but /hardware/go is only a
+diagnostic call that does not fire the laser.
 
 Before the first real run:
   1. Z903: connect the PC to the handheld's hotspot (or the same Wi-Fi) and turn on Remote Service.
@@ -61,6 +63,12 @@ STATUS_SKIP = {"CODE_NO_SAMPLE_DETECTED", "CODE_AIRSHOT_AUTO_ABORT"}   # log the
 # anything else (CODE_LOW_ARGON, CODE_ABORT, CODE_INVALID_CONFIG, CODE_WRONG_STAGE, ...) stops the run
 
 
+V2 = "/api/v2"
+# One location, a single laser shot, no cleaning or pre-burn shots (body from SciAps' example)
+SINGLE_SHOT = {"numLocations": 1, "numDataPulses": 1, "numCleaningPulses": 0,
+               "numPulsesToAvg": 1, "numPreBurnPulses": 0}
+
+
 def libs_base_url():
     return "http://{}:{}".format(LIBS_IP, LIBS_PORT)
 
@@ -74,11 +82,12 @@ class LibsRetry(Exception):
 
 
 class LibsClient:
-    def __init__(self, mode=LIBS_MODE, all_spectra=False, api="data", request=None, simulate=False):
+    def __init__(self, mode=LIBS_MODE, all_spectra=False, api="v2", request=None, simulate=False):
         self.mode = mode
-        self.request = request      # dict sent as the JSON body of /data/raster (LIBZAcquireRequest)
+        self.api = api              # "v2": /api/v2/acquire,  "data": /data/raster,  "hardware": /hardware/go
+        # JSON body of the acquire request (acquisition settings that override the handheld's saved ones)
+        self.request = request if request is not None else (dict(SINGLE_SHOT) if api == "v2" else None)
         self.all_spectra = all_spectra
-        self.api = api              # "data": /data/raster test,  "hardware": arm + /hardware/go
         self.armed = False
         self.simulate = simulate
         if not simulate:
@@ -98,17 +107,17 @@ class LibsClient:
     def settings(self):
         """Acquisition settings the handheld will use for this mode."""
         if self.simulate:
-            return {"mNumLocations": 1, "mNumCleaningPerLocation": 12, "mNumDataPerLocation": 16, "mUseArgon": False}
-        r = self.session.get(libs_base_url() + "/instrument/acquisitionParams",
-                             params={"mode": self.mode}, timeout=10)
+            return {"numLocations": 6, "numDataPulses": 16, "numCleaningPulses": 12, "argonEnabled": True}
+        path = V2 + "/acquisitionParams/factory" if self.api == "v2" else "/instrument/acquisitionParams"
+        r = self.session.get(libs_base_url() + path, params={"mode": self.mode}, timeout=10)
         r.raise_for_status()
         return r.json()
 
     def _check(self, r):
         """Raise LibsStop right away if the handheld does not support this request (no point retrying)."""
         if r.status_code in (400, 404, 405, 501):
-            hint = (" Edit the request body file and pass it with --request (e.g. --request acquire_request.json)."
-                    if self.api == "data" and "/data/raster" in r.url else "")
+            hint = (" Check the settings in the request body file (--request acquire_request.json)."
+                    if r.status_code == 400 and ("/acquire" in r.url or "/data/raster" in r.url) else "")
             detail = r.text.strip()[:300] or r.reason
             raise LibsStop("handheld rejected {} {} (HTTP {}: {}).{}".format(
                 r.request.method, r.url, r.status_code, detail, hint))
@@ -121,11 +130,27 @@ class LibsClient:
             return {"status": STATUS_OK, "abortedByUser": "false", "results": []}
         if self.api == "hardware":
             return self._shoot_hardware()
+        if self.api == "v2":
+            path = V2 + ("/acquire/all" if self.all_spectra else "/acquire")
+            r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, json=self.request,
+                                  timeout=LIBS_TIMEOUT_S)
+            self._check(r)
+            resp = r.json()
+            return resp if isinstance(resp, dict) else {"data": resp}
         path = "/data/raster/all" if self.all_spectra else "/data/raster"
         r = self.session.post(libs_base_url() + path, params={"mode": self.mode}, json=self.request,
                               timeout=LIBS_TIMEOUT_S)
         self._check(r)
         return r.json()
+
+    def abort(self):
+        """Stop a test that is running on the handheld (best effort, /api/v2 only)."""
+        if self.simulate or self.api != "v2":
+            return
+        try:
+            self.session.post(libs_base_url() + V2 + "/abort", timeout=5)
+        except Exception:
+            pass
 
     def hw_get(self, path):
         """GET a hardware register (e.g. /hardware/micro/142) and return its integer value."""
@@ -172,6 +197,8 @@ class LibsClient:
             try:
                 resp = self.shoot()
                 status = resp.get("status")
+                if status is None or str(status).upper() in ("SUCCESS", STATUS_OK):
+                    status = resp["status"] = STATUS_OK
                 if str(resp.get("abortedByUser")).lower() == "true":
                     raise LibsStop("test aborted on the handheld screen")
                 if status in STATUS_RETRY:
@@ -308,11 +335,24 @@ def load_resume(log_path):
     return grid, done
 
 
-def spectrum_rows(resp):
-    data = resp.get("data")
-    if data is None and resp.get("results"):
-        data = resp["results"][-1].get("spectrum", {}).get("mPixels")
-    return [r for r in (data or []) if isinstance(r, list) and any(r)]
+def spectrum_rows(resp, min_len=100):
+    """Every list of at least min_len numbers anywhere in the response (one per spectrometer channel/shot).
+    Works for /api/v2/acquire, /data/raster ("results" -> "spectrum" -> "mPixels") and /hardware/go ("data")."""
+    rows = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            if len(x) >= min_len and all(isinstance(v, (int, float)) for v in x):
+                if any(x):
+                    rows.append(x)
+            else:
+                for v in x:
+                    walk(v)
+    walk(resp)
+    return rows
 
 
 def peak_ratio(resp):
@@ -338,14 +378,9 @@ def load_request(path):
 
 def describe_data(resp):
     """Short summary of how much spectrum data a response holds."""
-    data = resp.get("data")
-    if data is None and resp.get("results"):
-        data = resp["results"][0].get("spectrum", {}).get("mPixels")
-    if not data:
-        return "NONE (empty)"
-    rows = [r for r in data if isinstance(r, list)]
+    rows = spectrum_rows(resp)
     if not rows:
-        return "{} values".format(len(data))
+        return "NONE (no spectrum found in the response)"
     nonzero = sum(1 for r in rows for v in r if v)
     ratio = peak_ratio(resp)
     verdict = ("looks like dark background only -- the laser probably did NOT fire" if ratio < DARK_RATIO
@@ -401,6 +436,18 @@ def print_settings(libs):
     except Exception as e:
         print("(Could not read the handheld's {} settings -- not supported by this firmware: {}. Continuing.)".format(
             libs.mode, str(e).split(" for url")[0]))
+        return
+    if libs.api == "v2":
+        used = dict(s, **(libs.request or {}))
+        keys = ("numLocations", "numCleaningPulses", "numPreBurnPulses", "numDataPulses", "numPulsesToAvg",
+                "argonEnabled")
+        print("Handheld {} settings used for each spot (saved values, overridden by the request body):".format(libs.mode))
+        print("  " + ", ".join("{}={}{}".format(k, used.get(k), "*" if k in (libs.request or {}) else "")
+                               for k in keys))
+        print("  (* = set by the request body)")
+        if (used.get("numLocations") or 1) > 1:
+            print("  WARNING: numLocations={} -- the handheld fires at {} spots of its own per grid point."
+                  .format(used.get("numLocations"), used.get("numLocations")))
         return
     print("Handheld {} settings: {} location(s) per test, {} cleaning + {} data shots per location, argon {}".format(
         libs.mode, s.get("mNumLocations"), s.get("mNumCleaningPerLocation"), s.get("mNumDataPerLocation"),
@@ -507,6 +554,8 @@ def run(args):
 
         stage.move(0, 0)
     except (KeyboardInterrupt, LibsStop, RuntimeError, TimeoutError) as e:
+        if isinstance(e, KeyboardInterrupt):
+            libs.abort()
         print("\nStopped: {}".format(e or "interrupted by user"))
         if os.path.exists(log_path + ".json"):
             print("Progress saved. To continue from the next spot run:\n  python raster_libs.py --resume {}".format(log_path))
@@ -524,12 +573,14 @@ def main():
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
     p.add_argument("--request", metavar="JSON_FILE",
-                   help="JSON body (LIBZAcquireRequest) sent with /data/raster, e.g. acquire_request.json")
+                   help="JSON file of acquisition settings sent with each test (default for --api v2: one "
+                        "location, 1 data shot, no cleaning shots), e.g. acquire_request.json")
     p.add_argument("--pulses", type=int, help="(--api hardware) micro register 142; had no effect on the lab Z903")
     p.add_argument("--locations", type=int,
                    help="(--api hardware) FPGA register 6; on the lab Z903 avgshots = locations / 4 (36 -> 9, 1 -> 0)")
-    p.add_argument("--api", choices=["data", "hardware"], default="data",
-                   help="data: full test via /data/raster (default); hardware: arm laser + /hardware/go")
+    p.add_argument("--api", choices=["v2", "data", "hardware"], default="v2",
+                   help="v2: /api/v2/acquire (default, current firmware); data: old /data/raster; "
+                        "hardware: /hardware/go (diagnostic only, does not fire the laser)")
     p.add_argument("--mode", default=LIBS_MODE, help="handheld app whose acquisition settings are used (default Geochem)")
     p.add_argument("--all-spectra", action="store_true", help="save every shot's spectrum, not just the average")
     p.add_argument("--settle-s", type=float, default=0.5, help="pause after stage stops, before firing")
