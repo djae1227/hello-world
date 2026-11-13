@@ -366,10 +366,13 @@ def peak_ratio(resp):
     return round(best, 2)
 
 
+HANDHELD = "handheld-settings"
 DARK_RATIO = 1.5   # below this the spectrum looks like detector background only (laser did not fire)
 
 
 def load_request(path):
+    if path == HANDHELD:
+        return {}               # empty body: every setting comes from the handheld's Factory Settings
     if not path:
         return None
     with open(path) as f:
@@ -476,7 +479,7 @@ def run(args):
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
                 "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra,
                 "api": args.api, "pulses": args.pulses, "locations": args.locations,
-                "request": os.path.abspath(args.request) if args.request else None}
+                "request": HANDHELD if args.handheld_settings else (os.path.abspath(args.request) if args.request else None)}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -572,6 +575,8 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--handheld-settings", action="store_true",
+                   help="use the handheld's own Factory Settings as they are (sends no overrides)")
     p.add_argument("--request", metavar="JSON_FILE",
                    help="JSON file of acquisition settings sent with each test (default for --api v2: one "
                         "location, 1 data shot, no cleaning shots), e.g. acquire_request.json")
@@ -605,7 +610,8 @@ def main():
 
     if args.libs_test:
         libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api,
-                          request=load_request(args.request), simulate=args.simulate)
+                          request=load_request(HANDHELD if args.handheld_settings else args.request),
+                          simulate=args.simulate)
         require_reachable(libs)
         setup_libs(libs, args.pulses, args.locations)
         t0 = time.time()
