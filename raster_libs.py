@@ -67,7 +67,9 @@ V2 = "/api/v2"
 # Settings sent with every test (field names from SciAps). The handheld's own saved "factory" values for
 # remote tests differ from its Factory Settings screen (12 locations, argon on), so always send these.
 # Change them with --shots / --avg / --cleaning / --argon, or a --request JSON file.
-DEFAULT_SPOT = {"numLocations": 1, "numDataPulses": 5, "numPulsesToAvg": 5, "numCleaningPulses": 0,
+# numPulsesToAvg=1 gives one spectrum per pulse (5 per spot); averaging all 5 into one spectrum was rejected
+# with CODE_INVALID_CONFIG, likely because of the handheld's "Min Average Shots = 2".
+DEFAULT_SPOT = {"numLocations": 1, "numDataPulses": 5, "numPulsesToAvg": 1, "numCleaningPulses": 0,
                 "numPreBurnPulses": 0, "argonEnabled": False}
 
 
@@ -589,6 +591,28 @@ def run(args):
         stage.close()
 
 
+def find_invalid(args):
+    """Fire one test per candidate body and print the handheld's status for each, to see which setting is invalid."""
+    target = build_request(args)
+    base = {"argonEnabled": target["argonEnabled"]}
+    trials = [("your settings", target), ("handheld's saved settings (argon as above)", base)]
+    for key, value in target.items():
+        if key != "argonEnabled":
+            trials.append(("saved settings + {}={}".format(key, value), dict(base, **{key: value})))
+    libs = LibsClient(mode=args.mode, api="v2", request=target, simulate=args.simulate)
+    require_reachable(libs)
+    print("Each accepted test fires the laser. Keep the sample in place.\n")
+    for name, body in trials:
+        libs.request = body
+        try:
+            status = libs.shoot().get("status") or STATUS_OK
+        except LibsStop as e:
+            status = str(e)
+        print("  {:<55} -> {}".format(name, status))
+    print("\nA setting whose line says CODE_INVALID_CONFIG (while the saved settings are accepted) is the one "
+          "the handheld rejects.")
+
+
 def main():
     global LIBS_IP, LIBS_PORT
     p = argparse.ArgumentParser(description="Automatic LIBS raster with Standa stage + SciAps Z903")
@@ -624,6 +648,9 @@ def main():
     p.add_argument("--no-home", action="store_true", help="skip homing (stage already zeroed)")
     p.add_argument("--no-libs", action="store_true", help="move the stage but do not fire")
     p.add_argument("--simulate", action="store_true", help="no hardware: fake stage and LIBS")
+    p.add_argument("--find-invalid", action="store_true",
+                   help="if tests return CODE_INVALID_CONFIG: try the settings one change at a time and report "
+                        "which one the handheld rejects (fires the laser for every accepted test)")
     p.add_argument("--libs-test", action="store_true", help="run a single LIBS test, save libs_test_<time>.json and exit")
     p.add_argument("--log", help="CSV log path")
     p.add_argument("--ip", help="handheld IP shown on its Remote Service screen (default {})".format(LIBS_IP))
@@ -633,6 +660,9 @@ def main():
     LIBS_IP = args.ip or LIBS_IP
     LIBS_PORT = args.port or LIBS_PORT
 
+    if args.find_invalid:
+        find_invalid(args)
+        return
     if args.libs_test:
         libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api,
                           request=build_request(args) if args.api == "v2" else load_request(args.request),

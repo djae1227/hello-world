@@ -1,7 +1,7 @@
 {
   "numLocations": 1,
   "numDataPulses": 5,
-  "numPulsesToAvg": 5,
+  "numPulsesToAvg": 1,
   "numCleaningPulses": 0,
   "numPreBurnPulses": 0
 }
