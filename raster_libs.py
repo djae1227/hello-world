@@ -64,9 +64,11 @@ STATUS_SKIP = {"CODE_NO_SAMPLE_DETECTED", "CODE_AIRSHOT_AUTO_ABORT"}   # log the
 
 
 V2 = "/api/v2"
-# One location, a single laser shot, no cleaning or pre-burn shots (body from SciAps' example)
-SINGLE_SHOT = {"numLocations": 1, "numDataPulses": 1, "numCleaningPulses": 0,
-               "numPulsesToAvg": 1, "numPreBurnPulses": 0}
+# Settings sent with every test (field names from SciAps). The handheld's own saved "factory" values for
+# remote tests differ from its Factory Settings screen (12 locations, argon on), so always send these.
+# Change them with --shots / --avg / --cleaning / --argon, or a --request JSON file.
+DEFAULT_SPOT = {"numLocations": 1, "numDataPulses": 5, "numPulsesToAvg": 5, "numCleaningPulses": 0,
+                "numPreBurnPulses": 0, "argonEnabled": False}
 
 
 def libs_base_url():
@@ -86,7 +88,7 @@ class LibsClient:
         self.mode = mode
         self.api = api              # "v2": /api/v2/acquire,  "data": /data/raster,  "hardware": /hardware/go
         # JSON body of the acquire request (acquisition settings that override the handheld's saved ones)
-        self.request = request if request is not None else (dict(SINGLE_SHOT) if api == "v2" else None)
+        self.request = request if request is not None else (dict(DEFAULT_SPOT) if api == "v2" else None)
         self.all_spectra = all_spectra
         self.armed = False
         self.simulate = simulate
@@ -204,7 +206,12 @@ class LibsClient:
                 if status in STATUS_RETRY:
                     raise LibsRetry(status)
                 if status != STATUS_OK and status not in STATUS_SKIP:
-                    raise LibsStop("handheld reported {}".format(status))
+                    hint = ""
+                    if status == "CODE_LOW_ARGON":
+                        hint = (" -- argon is ON for this run; refill the argon or run without --argon"
+                                if (self.request or {}).get("argonEnabled") else
+                                " even with argonEnabled=false; the handheld may need argon or SciAps' advice")
+                    raise LibsStop("handheld reported {}{}".format(status, hint))
                 return resp, attempt
             except LibsStop:
                 raise
@@ -372,11 +379,24 @@ DARK_RATIO = 1.5   # below this the spectrum looks like detector background only
 
 def load_request(path):
     if path == HANDHELD:
-        return {}               # empty body: every setting comes from the handheld's Factory Settings
+        return {}               # empty body: every setting comes from the handheld's saved values
     if not path:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def build_request(args):
+    """Settings body for each test: DEFAULT_SPOT (or nothing with --handheld-settings), then the --request file,
+    then --shots/--avg/--cleaning. Argon is off unless --argon is given."""
+    body = {} if args.handheld_settings else dict(DEFAULT_SPOT)
+    body.update(load_request(args.request) or {})
+    for key, value in (("numDataPulses", args.shots), ("numPulsesToAvg", args.avg),
+                       ("numCleaningPulses", args.cleaning)):
+        if value is not None:
+            body[key] = value
+    body["argonEnabled"] = bool(args.argon)
+    return body
 
 
 def describe_data(resp):
@@ -479,7 +499,7 @@ def run(args):
         grid = {"nx": args.nx, "ny": args.ny, "step_um": args.step_um, "z_um": args.z_um,
                 "serpentine": not args.no_serpentine, "mode": args.mode, "all_spectra": args.all_spectra,
                 "api": args.api, "pulses": args.pulses, "locations": args.locations,
-                "request": HANDHELD if args.handheld_settings else (os.path.abspath(args.request) if args.request else None)}
+                "request_body": build_request(args) if args.api == "v2" else load_request(args.request)}
         done = 0
 
     step_steps = round(grid["step_um"] / UM_PER_STEP)
@@ -492,7 +512,8 @@ def run(args):
         return
 
     libs = LibsClient(mode=grid.get("mode", LIBS_MODE), all_spectra=grid.get("all_spectra", False),
-                      api=grid.get("api", "data"), request=load_request(grid.get("request")),
+                      api=grid.get("api", "data"),
+                      request=grid["request_body"] if "request_body" in grid else load_request(grid.get("request")),
                       simulate=args.simulate or args.no_libs)
     require_reachable(libs)
     setup_libs(libs, grid.get("pulses"), grid.get("locations"))
@@ -575,11 +596,15 @@ def main():
     p.add_argument("-ny", type=int, default=5, help="number of points in Y")
     p.add_argument("--step-um", type=float, default=100.0, help="spacing between spots in um (multiple of 2.5)")
     p.add_argument("--z-um", type=float, default=None, help="move Z to this height (um) before rastering; default: leave Z")
+    p.add_argument("--shots", type=int, help="laser data pulses per spot (default {})".format(DEFAULT_SPOT["numDataPulses"]))
+    p.add_argument("--avg", type=int, help="pulses averaged per spectrum (default {})".format(DEFAULT_SPOT["numPulsesToAvg"]))
+    p.add_argument("--cleaning", type=int, help="cleaning pulses per spot (default 0)")
+    p.add_argument("--argon", action="store_true", help="turn argon purge on (default: off)")
     p.add_argument("--handheld-settings", action="store_true",
-                   help="use the handheld's own Factory Settings as they are (sends no overrides)")
+                   help="use the handheld's saved remote-test settings instead of the defaults (argon still off "
+                        "unless --argon)")
     p.add_argument("--request", metavar="JSON_FILE",
-                   help="JSON file of acquisition settings sent with each test (default for --api v2: one "
-                        "location, 1 data shot, no cleaning shots), e.g. acquire_request.json")
+                   help="JSON file of extra acquisition settings sent with each test, e.g. acquire_request.json")
     p.add_argument("--pulses", type=int, help="(--api hardware) micro register 142; had no effect on the lab Z903")
     p.add_argument("--locations", type=int,
                    help="(--api hardware) FPGA register 6; on the lab Z903 avgshots = locations / 4 (36 -> 9, 1 -> 0)")
@@ -610,7 +635,7 @@ def main():
 
     if args.libs_test:
         libs = LibsClient(mode=args.mode, all_spectra=args.all_spectra, api=args.api,
-                          request=load_request(HANDHELD if args.handheld_settings else args.request),
+                          request=build_request(args) if args.api == "v2" else load_request(args.request),
                           simulate=args.simulate)
         require_reachable(libs)
         setup_libs(libs, args.pulses, args.locations)
